@@ -1,6 +1,8 @@
-from sqlalchemy import Column, String, Integer, DateTime, Enum, Numeric, ForeignKey, JSON, Index
+from sqlalchemy import (
+    String, Integer, DateTime, Enum, Numeric, ForeignKey, JSON, Index
+)
 from sqlalchemy.orm import relationship, Mapped, mapped_column
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 import enum
 from .db import Base
@@ -43,12 +45,35 @@ class LedgerEntry(Base):
     amount_eur: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # + credit to participant, - debit
     source: Mapped[str] = mapped_column(String(32))   # meter|fee|tax|manual
     meta: Mapped[dict] = mapped_column(JSON, default={})
+    # WICHTIG: Ereigniszeit (nicht nur created_at), für EoD-Zuordnung
+    event_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
     participant = relationship("Participant")
     cycle = relationship("BillingCycle")
 
 Index("ix_ledger_cycle_participant", LedgerEntry.cycle_id, LedgerEntry.participant_id)
+
+class TradingDay(Base):
+    __tablename__ = "trading_days"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), index=True)
+    date_str: Mapped[str] = mapped_column(String(10), index=True)  # "YYYY-MM-DD"
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    cycle = relationship("BillingCycle")
+
+class DayNet(Base):
+    __tablename__ = "day_nets"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    day_id: Mapped[int] = mapped_column(ForeignKey("trading_days.id"), index=True)
+    participant_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), index=True)
+    net_eur: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # Tages-Netto (+ Auszahlung, - Rechnung)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    day = relationship("TradingDay")
+    participant = relationship("Participant")
 
 class SettlementRun(Base):
     __tablename__ = "settlement_runs"
@@ -69,3 +94,19 @@ class PayoutInstruction(Base):
     remittance_info: Mapped[str] = mapped_column(String(140))
     meta: Mapped[dict] = mapped_column(JSON, default={})
     participant = relationship("Participant")
+
+class InternalTransfer(Base):
+    """
+    EoD interne Ausgleichskante (kein externer Payout): debtor -> creditor amount_eur
+    Für Transparenz & spätere Bot-Verhandlung.
+    """
+    __tablename__ = "internal_transfers"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    day_id: Mapped[int] = mapped_column(ForeignKey("trading_days.id"), index=True)
+    from_participant_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), index=True)
+    to_participant_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), index=True)
+    amount_eur: Mapped[Decimal] = mapped_column(Numeric(18,4))
+    meta: Mapped[dict] = mapped_column(JSON, default={})
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    day = relationship("TradingDay")
