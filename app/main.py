@@ -79,3 +79,21 @@ def participant_statement(cycle_label: str, participant_external_id: str, db: Se
     if not part:
         raise HTTPException(404, "Participant not found")
     return logic.statement_for_participant(db, cycle, part)
+
+@app.post("/v1/quickstart", dependencies=[Depends(require_api_key)])
+def quickstart(db: Session = Depends(get_db)):
+    from . import models, logic
+    op = logic.upsert_participant(db, "op-001", "Colibrie Operator", models.Role.OPERATOR, "AT611904300234573201", os.getenv("KYDE_API_KEY","seed"))
+    pros = logic.upsert_participant(db, "pros-001", "PV Dach A", models.Role.PROSUMER, "AT611904300234573202", os.getenv("KYDE_API_KEY","seed"))
+    con = logic.upsert_participant(db, "con-001", "Mieter A", models.Role.CONSUMER, "AT611904300234573203", os.getenv("KYDE_API_KEY","seed"))
+    # simple policy
+    from .models import Policy
+    if not db.query(Policy).filter_by(version="v1").first():
+        from .utils import hash_policy
+        pol = Policy(version="v1", hash_hex=hash_policy({"operator_fee_pct":0.05}), data={"operator_fee_pct":0.05})
+        db.add(pol); db.commit()
+    # events
+    cycle = logic.get_or_create_cycle(db, "2025-08")
+    logic.add_ledger_entry(db, cycle, pros, Decimal("40.00"), "meter", {"kwh":100,"type":"export"})
+    logic.add_ledger_entry(db, cycle, con,  Decimal("-25.50"), "meter", {"kwh":85,"type":"import"})
+    return {"ok": True}
