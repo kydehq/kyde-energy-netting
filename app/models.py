@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, DateTime, Enum, Numeric, ForeignKey, Boolean, JSON, UniqueConstraint, Index
+from sqlalchemy import Column, String, Integer, DateTime, Enum, Numeric, ForeignKey, JSON, Index
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from datetime import datetime
 from decimal import Decimal
@@ -40,7 +40,7 @@ class LedgerEntry(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), index=True)
     participant_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), index=True)
-    amount_eur: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # + = credit to participant, - = debit
+    amount_eur: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # + credit to participant, - debit
     source: Mapped[str] = mapped_column(String(32))   # meter|fee|tax|manual
     meta: Mapped[dict] = mapped_column(JSON, default={})
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
@@ -56,8 +56,7 @@ class SettlementRun(Base):
     cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     policy_version: Mapped[str] = mapped_column(String(64))
-    summary: Mapped[dict] = mapped_column(JSON)  # totals, counts, etc.
-
+    summary: Mapped[dict] = mapped_column(JSON)  # totals, counts, audit_hash, etc.
     cycle = relationship("BillingCycle")
 
 class PayoutInstruction(Base):
@@ -69,5 +68,4 @@ class PayoutInstruction(Base):
     amount_eur: Mapped[Decimal] = mapped_column(Numeric(18,4))  # positive = pay this participant
     remittance_info: Mapped[str] = mapped_column(String(140))
     meta: Mapped[dict] = mapped_column(JSON, default={})
-
     participant = relationship("Participant")
