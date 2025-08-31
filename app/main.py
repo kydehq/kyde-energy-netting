@@ -1,15 +1,17 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import select, func
 from decimal import Decimal
 from datetime import datetime
-import os
+import os, json
 
 from .db import Base, engine, get_db
 from . import models, schemas, logic
 from .security import require_api_key
 from .utils import hash_policy
+from .policy_dsl import PolicyEngine, canonical_hash
 
-app = FastAPI(title="KYDE EoD Netting MVP", version="0.3.0")
+app = FastAPI(title="KYDE EoD Netting + Policy DSL", version="0.4.0")
 
 @app.on_event("startup")
 def startup():
@@ -19,40 +21,132 @@ def startup():
 def health():
     return {"ok": True}
 
-# --- Participants
+# ---------------- Participants
 @app.post("/v1/participants", dependencies=[Depends(require_api_key)], response_model=schemas.ParticipantOut)
 def create_participant(body: schemas.ParticipantCreate, db: Session = Depends(get_db)):
     role = models.Role(body.role)
     p = logic.upsert_participant(db, body.external_id, body.name, role, body.iban, api_key_seed=os.getenv("KYDE_API_KEY","seed"))
     return schemas.ParticipantOut(id=p.id, external_id=p.external_id, name=p.name, role=p.role.value, iban=p.iban)
 
-# --- Policy
-@app.post("/v1/policy", dependencies=[Depends(require_api_key)])
+# ---------------- Policy CRUD
+@app.post("/v1/policy", dependencies=[Depends(require_api_key)], response_model=schemas.PolicyOut)
 def set_policy(body: schemas.PolicyIn, db: Session = Depends(get_db)):
-    h = hash_policy(body.data)
+    # Validate + hash canonical
+    chash = canonical_hash(body.data)
     exists = db.query(models.Policy).filter(models.Policy.version==body.version).first()
     if exists:
         raise HTTPException(409, "Policy version exists")
-    pol = models.Policy(version=body.version, hash_hex=h, data=body.data)
+    pol = models.Policy(version=body.version, hash_hex=chash, signature=body.signature, data=body.data)
     db.add(pol); db.commit()
-    return {"version": pol.version, "hash": pol.hash_hex}
+    return schemas.PolicyOut(version=pol.version, hash=pol.hash_hex, signature=pol.signature)
 
-# --- Events -> Ledger
+@app.get("/v1/policy/{version}", dependencies=[Depends(require_api_key)])
+def get_policy(version: str, db: Session = Depends(get_db)):
+    pol = db.query(models.Policy).filter_by(version=version).first()
+    if not pol: raise HTTPException(404, "Policy not found")
+    return {"version": pol.version, "hash": pol.hash_hex, "signature": pol.signature, "data": pol.data}
+
+# ---------------- Events (plain ledger + policy-eval-on-event)
 @app.post("/v1/events", dependencies=[Depends(require_api_key)])
 def ingest_event(ev: schemas.EventIn, db: Session = Depends(get_db)):
     cycle = logic.get_or_create_cycle(db, ev.cycle_label)
     if cycle.status != "open":
         raise HTTPException(400, "Cycle is closed")
+
     part = db.query(models.Participant).filter_by(external_id=ev.participant_external_id).first()
-    if not part:
-        raise HTTPException(404, "Participant not found")
+    if not part: raise HTTPException(404, "Participant not found")
+
+    # 1) Raw ledger line (as before)
     logic.add_ledger_entry(db, cycle, part, Decimal(ev.amount_eur), ev.source, ev.meta, ev.event_ts)
+
     return {"ok": True}
 
-# --- EoD Close: 24:00 Leveling (keine externen Payouts)
+@app.post("/v1/events+policy", dependencies=[Depends(require_api_key)])
+def ingest_event_and_eval(body: schemas.EventInWithPolicy, db: Session = Depends(get_db)):
+    ev = body.event
+    cycle = logic.get_or_create_cycle(db, ev.cycle_label)
+    if cycle.status != "open":
+        raise HTTPException(400, "Cycle is closed")
+    part = db.query(models.Participant).filter_by(external_id=ev.participant_external_id).first()
+    if not part: raise HTTPException(404, "Participant not found")
+
+    # 1) Raw event line
+    base_entry = logic.add_ledger_entry(db, cycle, part, Decimal(ev.amount_eur), ev.source, ev.meta, ev.event_ts)
+
+    # 2) Policy evaluate (if provided, else latest)
+    pol = None
+    if body.policy_version:
+        pol = db.query(models.Policy).filter_by(version=body.policy_version).first()
+    else:
+        pol = db.query(models.Policy).order_by(models.Policy.id.desc()).first()
+    if not pol:
+        return {"ok": True, "note": "no policy set, raw event stored"}
+
+    engine = PolicyEngine(pol.data)
+    operator = db.scalar(select(models.Participant).where(models.Participant.role == models.Role.OPERATOR))
+    operator_id = operator.id if operator else None
+
+    # Build event dict for engine
+    ev_dict = {
+        "source": ev.source,
+        "meta": ev.meta,
+        "amount_eur": str(ev.amount_eur),
+        "participant_external_id": ev.participant_external_id,
+        "event_ts": (ev.event_ts.isoformat() if ev.event_ts else None)
+    }
+    postings, trace = engine.evaluate_event(ev_dict, part.role.value if part.role else None, operator_id)
+
+    # 3) Persist postings as additional ledger entries (source = rule_id via account mapping in trace)
+    # We map accounts to entries by using trace.evaluations order; we also store explain trace row.
+    # For simplicity: per-account postings -> participant = primary participant unless beneficiary=OPERATOR rule fired.
+    # We'll augment via evaluations to detect beneficiaries.
+    # First, index evals by account cumulative impact; then write lines
+    per_account = {k: Decimal(v) for k, v in trace["totals"]["per_account"].items()}
+    evals = trace["evaluations"]
+
+    created_ids = []
+    for e in evals:
+        if not e.get("matched"): 
+            continue
+        amt = Decimal(e.get("result_eur","0") or "0")
+        if amt == 0: 
+            continue
+        beneficiary_pid = None
+        if e.get("beneficiary") == "OPERATOR" and operator_id:
+            beneficiary_pid = operator_id
+        target_pid = beneficiary_pid or part.id
+        # rule_id as source, account in meta
+        entry = logic.add_ledger_entry(
+            db, cycle, db.get(models.Participant, target_pid),
+            amt, e["rule_id"], {"account": None, "policy": pol.version, "explain": True},
+            ev.event_ts
+        )
+        e["ledger_line_id"] = entry.id
+        created_ids.append(entry.id)
+
+    # 4) Persist ExplainTrace (optional but great)
+    trace_blob = {
+        "scope": "event",
+        "key": f"{part.external_id}@{ev.event_ts.isoformat() if ev.event_ts else 'now'}",
+        "evaluations": evals,
+        "totals": trace["totals"]
+    }
+    trace_hash = canonical_hash(trace_blob)
+    db.add(models.ExplainTrace(
+        cycle_id=cycle.id,
+        participant_id=part.id,
+        scope="event",
+        key=trace_blob["key"],
+        trace_json=json.dumps(trace_blob, ensure_ascii=False, separators=(",",":")),
+        trace_hash=trace_hash
+    ))
+    db.commit()
+
+    return {"ok": True, "policy_version": pol.version, "explain_hash": trace_hash, "created_lines": created_ids}
+
+# -------- EoD Close: 24:00 Leveling
 @app.post("/v1/days/{date_str}/close", dependencies=[Depends(require_api_key)])
 def close_day(date_str: str, body: schemas.CloseDayIn, db: Session = Depends(get_db)):
-    # cycle label aus date_str ableiten: YYYY-MM
     if len(date_str) != 10:
         raise HTTPException(400, "date_str must be YYYY-MM-DD")
     cycle_label = date_str[:7]
@@ -74,7 +168,6 @@ def close_day(date_str: str, body: schemas.CloseDayIn, db: Session = Depends(get
         "audit_hash": audit
     }
 
-# --- Inspect Day Nets
 @app.get("/v1/days/{date_str}/nets", dependencies=[Depends(require_api_key)], response_model=schemas.DayNetOut)
 def read_day_net(date_str: str, db: Session = Depends(get_db)):
     cycle_label = date_str[:7]
@@ -90,8 +183,7 @@ def read_day_net(date_str: str, db: Session = Depends(get_db)):
     total = sum(Decimal(r["net_eur"]) for r in items) if items else Decimal("0.00")
     return {"date": date_str, "items": items, "totals": {"sum": str(total)}}
 
-# --- Inspect Day Internal Transfers
-@app.get("/v1/days/{date_str}/internal-transfers", dependencies=[Depends(require_api_key)], response_model=schemas.InternalTransfersOut)
+@app.get("/v1/days/{date_str}/internal-transfers", dependencies=[Depends(require_api_key)])
 def read_internal_transfers(date_str: str, db: Session = Depends(get_db)):
     cycle_label = date_str[:7]
     cycle = db.query(models.BillingCycle).filter_by(label=cycle_label).first()
@@ -105,14 +197,13 @@ def read_internal_transfers(date_str: str, db: Session = Depends(get_db)):
     edges = [{"from_id": r.from_participant_id, "to_id": r.to_participant_id, "amount_eur": str(r.amount_eur)} for r in rows]
     return {"date": date_str, "edges": edges}
 
-# --- Month Close: erzeugt externe Payout-Instruktionen (auf Basis der DayNets)
+# -------- Month Close: Payouts
 @app.post("/v1/cycles/{cycle_label}/close", dependencies=[Depends(require_api_key)], response_model=schemas.SettlementOut)
 def close_cycle(cycle_label: str, body: schemas.CloseCycleIn, db: Session = Depends(get_db)):
     cycle = logic.get_or_create_cycle(db, cycle_label)
     if cycle.status == "closed":
         raise HTTPException(400, "Already closed")
 
-    # Optional: verhindern, dass offene Tage existieren
     open_days = db.query(models.TradingDay).filter_by(cycle_id=cycle.id, status="open").count()
     if open_days:
         raise HTTPException(400, f"{open_days} trading day(s) still open in {cycle_label}")
@@ -135,7 +226,7 @@ def close_cycle(cycle_label: str, body: schemas.CloseCycleIn, db: Session = Depe
         "totals": run.summary
     }
 
-# --- Statements (Monats-Sicht)
+# -------- Statements
 @app.get("/v1/cycles/{cycle_label}/statements/{participant_external_id}", dependencies=[Depends(require_api_key)], response_model=schemas.StatementOut)
 def participant_statement(cycle_label: str, participant_external_id: str, db: Session = Depends(get_db)):
     cycle = db.query(models.BillingCycle).filter_by(label=cycle_label).first()
@@ -145,3 +236,15 @@ def participant_statement(cycle_label: str, participant_external_id: str, db: Se
     if not part:
         raise HTTPException(404, "Participant not found")
     return logic.statement_for_participant(db, cycle, part)
+
+# -------- Explain Trace Lookup (optional helper)
+@app.get("/v1/explain/{participant_external_id}/{cycle_label}")
+def get_explains(participant_external_id: str, cycle_label: str, db: Session = Depends(get_db)):
+    cycle = db.query(models.BillingCycle).filter_by(label=cycle_label).first()
+    if not cycle: raise HTTPException(404, "Cycle not found")
+    part = db.query(models.Participant).filter_by(external_id=participant_external_id).first()
+    if not part: raise HTTPException(404, "Participant not found")
+    rows = db.query(models.ExplainTrace).filter_by(cycle_id=cycle.id, participant_id=part.id).order_by(models.ExplainTrace.id.desc()).limit(50).all()
+    return [{
+        "scope": r.scope, "key": r.key, "trace_hash": r.trace_hash, "trace": json.loads(r.trace_json)
+    } for r in rows]

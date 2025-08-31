@@ -1,8 +1,9 @@
 from sqlalchemy import (
-    String, Integer, DateTime, Enum, Numeric, ForeignKey, JSON, Index
+    String, Integer, DateTime, Enum, Numeric, ForeignKey, JSON, Index, Text
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
-from datetime import datetime, date
+    # noqa
+from datetime import datetime
 from decimal import Decimal
 import enum
 from .db import Base
@@ -27,6 +28,7 @@ class Policy(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     version: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     hash_hex: Mapped[str] = mapped_column(String(128), unique=True)
+    signature: Mapped[str | None] = mapped_column(String(512), nullable=True)
     data: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -43,9 +45,8 @@ class LedgerEntry(Base):
     cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), index=True)
     participant_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), index=True)
     amount_eur: Mapped[Decimal] = mapped_column(Numeric(18, 4))  # + credit to participant, - debit
-    source: Mapped[str] = mapped_column(String(32))   # meter|fee|tax|manual
+    source: Mapped[str] = mapped_column(String(64))   # meter|fee|tax|manual|<rule_id>
     meta: Mapped[dict] = mapped_column(JSON, default={})
-    # WICHTIG: Ereigniszeit (nicht nur created_at), für EoD-Zuordnung
     event_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
@@ -96,10 +97,6 @@ class PayoutInstruction(Base):
     participant = relationship("Participant")
 
 class InternalTransfer(Base):
-    """
-    EoD interne Ausgleichskante (kein externer Payout): debtor -> creditor amount_eur
-    Für Transparenz & spätere Bot-Verhandlung.
-    """
     __tablename__ = "internal_transfers"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     day_id: Mapped[int] = mapped_column(ForeignKey("trading_days.id"), index=True)
@@ -110,3 +107,20 @@ class InternalTransfer(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     day = relationship("TradingDay")
+
+class ExplainTrace(Base):
+    """
+    Optional persistierter Explain-Trace pro Event (oder Day/Cycle).
+    """
+    __tablename__ = "explain_traces"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cycle_id: Mapped[int] = mapped_column(ForeignKey("billing_cycles.id"), index=True)
+    participant_id: Mapped[int] = mapped_column(ForeignKey("participants.id"), index=True)
+    scope: Mapped[str] = mapped_column(String(16))  # "event" | "day" | "cycle"
+    key: Mapped[str] = mapped_column(String(64))    # z.B. event-id oder date_str
+    trace_json: Mapped[str] = mapped_column(Text)
+    trace_hash: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    cycle = relationship("BillingCycle")
+    participant = relationship("Participant")
