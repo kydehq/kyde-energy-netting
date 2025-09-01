@@ -1,5 +1,25 @@
+# Virtual Envs
+.venv/
 venv/
+env/
+
+# Python Cache/Build
 __pycache__/
-*.pyc
-.env
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Datenbanken / Dateien, die nicht ins Repo gehören
+*.db
 dummy.db
+
+# Env/Secrets
+.env
+.env.*
+
+# Editor/OS
+.DS_Store
+.vscode/
+.idea/
