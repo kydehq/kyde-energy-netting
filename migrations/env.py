@@ -1,4 +1,8 @@
 from __future__ import annotations
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from logging.config import fileConfig
 import os
 from sqlalchemy import engine_from_config, pool
@@ -44,8 +48,7 @@ def run_migrations_offline():
         context.run_migrations()
 
 def run_migrations_online():
-    configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = get_url()
+    configuration = {"url": get_url()}
 
     connectable = engine_from_config(
         configuration,
