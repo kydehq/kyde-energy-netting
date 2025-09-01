@@ -13,17 +13,18 @@ from .policy_dsl import PolicyEngine, canonical_hash
 
 app = FastAPI(title="KYDE EoD Netting + Policy DSL", version="0.4.0")
 
-@app.on_event("startup")
 def startup():
-    # Quick fix: add signature column manually
     from sqlalchemy import text
     try:
         with engine.connect() as conn:
+            # Add all potentially missing columns
             conn.execute(text("ALTER TABLE policies ADD COLUMN IF NOT EXISTS signature VARCHAR(512)"))
+            conn.execute(text("ALTER TABLE ledger_entries ADD COLUMN IF NOT EXISTS event_ts TIMESTAMP"))
+            # Falls noch andere fehlen...
             conn.commit()
-            print("Signature column added successfully")
+            print("Schema updated successfully")
     except Exception as e:
-        print(f"Column add failed (maybe already exists): {e}")
+        print(f"Schema update failed: {e}")
 
 @app.get("/healthz")
 def health():
