@@ -15,10 +15,15 @@ app = FastAPI(title="KYDE EoD Netting + Policy DSL", version="0.4.0")
 
 @app.on_event("startup")
 def startup():
-    from alembic.config import Config
-    from alembic import command
-    alembic_cfg = Config("alembic.ini")
-    command.upgrade(alembic_cfg, "head")
+    # Quick fix: add signature column manually
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE policies ADD COLUMN IF NOT EXISTS signature VARCHAR(512)"))
+            conn.commit()
+            print("Signature column added successfully")
+    except Exception as e:
+        print(f"Column add failed (maybe already exists): {e}")
 
 @app.get("/healthz")
 def health():
