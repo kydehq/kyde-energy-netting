@@ -15,13 +15,12 @@ app = FastAPI(title="KYDE EoD Netting + Policy DSL", version="0.4.0")
 
 @app.on_event("startup")
 def startup():
-    # Base.metadata.create_all(bind=engine)  # ← RAUS!
-    
-    # Alembic Migration
-    from alembic.config import Config
-    from alembic import command
-    alembic_cfg = Config("alembic.ini")
-    command.upgrade(alembic_cfg, "head")
+    # Migration temporarily disabled for debugging
+    pass
+    # from alembic.config import Config
+    # from alembic import command
+    # alembic_cfg = Config("alembic.ini")
+    # command.upgrade(alembic_cfg, "head")
 
 @app.get("/healthz")
 def health():

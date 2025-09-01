@@ -6,7 +6,7 @@ from alembic import context
 
 # --- Deine App-Modelle importieren
 from app.db import Base  # Base = DeclarativeBase
-from app import models   # noqa: F401  (wichtig: import, damit Modelle registriert sind)
+from app import models   # Import models.py to register all model classes
 
 # Alembic Config
 config = context.config
